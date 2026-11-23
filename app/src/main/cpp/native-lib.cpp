@@ -1,4 +1,5 @@
 #include <jni.h>
+#include <cstdint>
 #include <oboe/Oboe.h>
 #include <atomic>
 #include <array>
@@ -121,10 +122,40 @@ private:
     float lastPitch_ = 1e9f, lastLs_ = 1e9f, lastPr_ = 1e9f;
 };
 
-// ---- Oboe motoru: giris akisi + cikis akisi callback'i ----
-class Engine : public oboe::AudioStreamDataCallback {
+// ---- Tek uretici / tek tuketici halka tampon (giris -> cikis) ----
+class Ring {
+public:
+    void clear() { w_.store(0); r_.store(0); }
+    uint32_t available() const { return w_.load(std::memory_order_acquire) - r_.load(std::memory_order_acquire); }
+    // Uretici (giris callback'i)
+    void push(const float* x, uint32_t n) {
+        uint32_t w = w_.load(std::memory_order_relaxed);
+        uint32_t used = w - r_.load(std::memory_order_acquire);
+        uint32_t room = kSize - used;
+        if (n > room) n = room;
+        for (uint32_t i = 0; i < n; ++i) buf_[(w + i) & kMask] = x[i];
+        w_.store(w + n, std::memory_order_release);
+    }
+    // Tuketici (cikis callback'i)
+    void pop(float* o, uint32_t n) {
+        uint32_t r = r_.load(std::memory_order_relaxed);
+        for (uint32_t i = 0; i < n; ++i) o[i] = buf_[(r + i) & kMask];
+        r_.store(r + n, std::memory_order_release);
+    }
+    void skip(uint32_t n) { r_.store(r_.load(std::memory_order_relaxed) + n, std::memory_order_release); }
+private:
+    static constexpr uint32_t kSize = 16384, kMask = kSize - 1;
+    std::array<float, kSize> buf_{};
+    std::atomic<uint32_t> w_{0}, r_{0};
+};
+
+// ---- Oboe motoru: giris callback'i isler ve tampona yazar, cikis callback'i tampondan okur ----
+class Engine {
 public:
     bool start() {
+        ring_.clear();
+        primed_ = false;
+
         oboe::AudioStreamBuilder in;
         in.setDirection(oboe::Direction::Input)
           ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
@@ -133,7 +164,8 @@ public:
           ->setChannelCount(1)
           ->setSampleRate(kSampleRate)
           ->setSampleRateConversionQuality(oboe::SampleRateConversionQuality::Medium)
-          ->setInputPreset(oboe::InputPreset::VoicePerformance);
+          ->setInputPreset(oboe::InputPreset::VoicePerformance)
+          ->setDataCallback(&inCb_);
         if (in.openStream(in_) != oboe::Result::OK) return false;
 
         oboe::AudioStreamBuilder out;
@@ -145,8 +177,14 @@ public:
            ->setSampleRate(kSampleRate)
            ->setSampleRateConversionQuality(oboe::SampleRateConversionQuality::Medium)
            ->setUsage(oboe::Usage::VoiceCommunication)
-           ->setDataCallback(this);
+           ->setDataCallback(&outCb_);
         if (out.openStream(out_) != oboe::Result::OK) { cleanup(); return false; }
+
+        // Tampon hedefi: iki akisin patlama boyutlarina gore, en az ~10 ms.
+        uint32_t ib = std::max(in_->getFramesPerBurst(), 1);
+        uint32_t ob = std::max(out_->getFramesPerBurst(), 1);
+        prime_ = std::max<uint32_t>(480, 2 * ob + ib);
+        maxFill_ = prime_ + 4 * std::max(ib, ob);
 
         if (in_->requestStart() != oboe::Result::OK || out_->requestStart() != oboe::Result::OK) {
             cleanup();
@@ -157,28 +195,71 @@ public:
 
     void stop() { cleanup(); }
 
-    oboe::DataCallbackResult onAudioReady(oboe::AudioStream*, void* data, int32_t frames) override {
-        auto* o = static_cast<float*>(data);
-        if (!in_) { std::fill(o, o + frames, 0.f); return oboe::DataCallbackResult::Continue; }
-        auto r = in_->read(o, frames, 0);  // bloklamaz
-        int32_t got = r ? r.value() : 0;
-        if (got < 0) got = 0;
-        for (int32_t i = got; i < frames; ++i) o[i] = 0.f;
-        for (int32_t i = 0; i < frames; ++i) {
-            float s = o[i];
-            o[i] = std::isfinite(s) ? chain_.process(s) : 0.f;
+private:
+    void onInput(const float* in, int32_t frames) {
+        float tmp[256];
+        int32_t done = 0;
+        while (done < frames) {
+            int32_t n = std::min<int32_t>(256, frames - done);
+            for (int32_t i = 0; i < n; ++i) {
+                float s = in[done + i];
+                tmp[i] = std::isfinite(s) ? chain_.process(s) : 0.f;
+            }
+            ring_.push(tmp, static_cast<uint32_t>(n));
+            done += n;
         }
-        return oboe::DataCallbackResult::Continue;
     }
 
-private:
-    void cleanup() {
-        // Once cikisi kapat ki callback giris akisina dokunmasin.
-        if (out_) { out_->stop(); out_->close(); out_.reset(); }
-        if (in_) { in_->stop(); in_->close(); in_.reset(); }
+    void onOutput(float* o, int32_t frames) {
+        uint32_t avail = ring_.available();
+        if (!primed_) {
+            if (avail < prime_) { std::fill(o, o + frames, 0.f); return; }
+            primed_ = true;
+        }
+        if (avail > maxFill_) { ring_.skip(avail - prime_); avail = prime_; }  // gecikme birikmesin
+        uint32_t want = static_cast<uint32_t>(frames);
+        if (avail < want) {
+            ring_.pop(o, avail);
+            std::fill(o + avail, o + frames, 0.f);
+            primed_ = false;  // tampon bosaldi: yeniden doldur
+        } else {
+            ring_.pop(o, want);
+        }
     }
+
+    struct InCb : oboe::AudioStreamDataCallback {
+        Engine* e = nullptr;
+        oboe::DataCallbackResult onAudioReady(oboe::AudioStream*, void* d, int32_t n) override {
+            e->onInput(static_cast<const float*>(d), n);
+            return oboe::DataCallbackResult::Continue;
+        }
+    };
+    struct OutCb : oboe::AudioStreamDataCallback {
+        Engine* e = nullptr;
+        oboe::DataCallbackResult onAudioReady(oboe::AudioStream*, void* d, int32_t n) override {
+            e->onOutput(static_cast<float*>(d), n);
+            return oboe::DataCallbackResult::Continue;
+        }
+    };
+
+    void cleanup() {
+        if (in_) in_->stop();
+        if (out_) out_->stop();
+        if (in_) { in_->close(); in_.reset(); }
+        if (out_) { out_->close(); out_.reset(); }
+    }
+
+public:
+    Engine() { inCb_.e = this; outCb_.e = this; }
+
+private:
     std::shared_ptr<oboe::AudioStream> in_, out_;
+    InCb inCb_;
+    OutCb outCb_;
+    Ring ring_;
     Chain chain_;
+    bool primed_ = false;
+    uint32_t prime_ = 480, maxFill_ = 2400;
 };
 
 std::unique_ptr<Engine> gEngine;

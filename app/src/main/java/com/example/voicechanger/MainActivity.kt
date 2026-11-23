@@ -35,6 +35,14 @@ class MainActivity : Activity() {
         root.addView(toggle)
         meter = TextView(this)
         root.addView(meter)
+        root.addView(LinearLayout(this).apply {
+            fun preset(name: String, values: Map<Int, Float>) = Button(this@MainActivity).apply {
+                text = name
+                setOnClickListener { Settings.applyPreset(this@MainActivity, values); recreate() }
+            }
+            addView(preset("Genç (18 yaş)", Settings.presetYoung))
+            addView(preset("Spiker", Settings.presetAnnouncer))
+        })
         root.addView(TextView(this).apply {
             text = "Kendi sesini duymamak için \"Kendi sesimi dinleme\" 0 kalsın. Dinlemek istersen kulaklık tak (hoparlörde ıslık yapar)."
             setPadding(0, pad, 0, pad)

@@ -13,10 +13,10 @@ namespace {
 constexpr float kPi = 3.14159265358979f;
 constexpr int kSampleRate = 48000;
 
-enum Param { kPitch = 0, kLowShelf, kPresence, kDeessThr, kCompThr, kParamCount };
+enum Param { kPitch = 0, kLowShelf, kPresence, kDeessThr, kCompThr, kGain, kParamCount };
 
 // Kalibre edilmemiş başlangıç değerleri (Settings.kt ile aynı).
-std::array<std::atomic<float>, kParamCount> gParams = {{ -1.f, 3.f, 2.f, -30.f, -18.f }};
+std::array<std::atomic<float>, kParamCount> gParams = {{ -1.f, 6.f, 4.f, -30.f, -18.f, 12.f }};
 
 // ---- Saf DSP bloklari (cihazsiz test edilebilir) ----
 struct Biquad {
@@ -88,7 +88,7 @@ public:
 
     float process(float x) {
         refresh();
-        x = hp_.process(x);
+        x = hp_.process(x) * gain_;  // giris seviyesi: esikler anlamli olsun diye kompresorden once
         x = pitch_.process(x, ratio_);
         x = low_.process(x);
         x = pres_.process(x);
@@ -102,24 +102,26 @@ public:
         float lvl = 20.f * std::log10(std::fabs(x) + 1e-9f);
         float tg = lvl > compThr_ ? std::pow(10.f, -(lvl - compThr_) * (1.f - 1.f / 3.f) / 20.f) : 1.f;
         compGain_ += (tg - compGain_) * (tg < compGain_ ? 0.01f : 0.0004f);
-        x *= compGain_;
+        x *= compGain_ * kMakeup;
         return std::tanh(x);  // yumusak limiter
     }
 
 private:
     void refresh() {
         float p = gParams[kPitch], ls = gParams[kLowShelf], pr = gParams[kPresence];
-        float dt = gParams[kDeessThr], ct = gParams[kCompThr];
+        float dt = gParams[kDeessThr], ct = gParams[kCompThr], g = gParams[kGain];
         if (p != lastPitch_) { lastPitch_ = p; ratio_ = std::pow(2.f, p / 12.f); }
-        if (ls != lastLs_) { lastLs_ = ls; low_.lowShelf(kSampleRate, 200.f, ls); }
+        if (ls != lastLs_) { lastLs_ = ls; low_.lowShelf(kSampleRate, 220.f, ls); }
         if (pr != lastPr_) { lastPr_ = pr; pres_.peaking(kSampleRate, 3000.f, 1.f, pr); }
+        if (g != lastGain_) { lastGain_ = g; gain_ = std::pow(10.f, g / 20.f); }
         deessThr_ = dt; compThr_ = ct;
     }
     Biquad hp_, sideHp_, low_, pres_;
     PitchShifter pitch_;
-    float ratio_ = 1.f, deessGain_ = 1.f, compGain_ = 1.f;
+    static constexpr float kMakeup = 2.f;  // ~+6 dB kompresor sonrasi
+    float ratio_ = 1.f, deessGain_ = 1.f, compGain_ = 1.f, gain_ = 1.f;
     float deessThr_ = -30.f, compThr_ = -18.f;
-    float lastPitch_ = 1e9f, lastLs_ = 1e9f, lastPr_ = 1e9f;
+    float lastPitch_ = 1e9f, lastLs_ = 1e9f, lastPr_ = 1e9f, lastGain_ = 1e9f;
 };
 
 // ---- Tek uretici / tek tuketici halka tampon (giris -> cikis) ----
@@ -176,7 +178,8 @@ public:
            ->setChannelCount(1)
            ->setSampleRate(kSampleRate)
            ->setSampleRateConversionQuality(oboe::SampleRateConversionQuality::Medium)
-           ->setUsage(oboe::Usage::VoiceCommunication)
+           ->setUsage(oboe::Usage::Media)
+           ->setContentType(oboe::ContentType::Speech)
            ->setDataCallback(&outCb_);
         if (out.openStream(out_) != oboe::Result::OK) { cleanup(); return false; }
 

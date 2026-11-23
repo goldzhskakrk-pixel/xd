@@ -7,116 +7,20 @@
 #include <memory>
 #include <vector>
 #include <algorithm>
-#include "signalsmith-stretch.h"
+#include "dsp.h"
 
 namespace {
 
-constexpr float kPi = 3.14159265358979f;
-constexpr int kSampleRate = 48000;
+using dsp::Chain;
+using dsp::kParamCount;
 
-enum Param { kPitch = 0, kLowShelf, kPresence, kDeessThr, kCompThr, kGain, kGate, kParamCount };
+std::array<std::atomic<float>, kParamCount> gParams;
 
-// Kalibre edilmemiş başlangıç değerleri (Settings.kt ile aynı).
-std::array<std::atomic<float>, kParamCount> gParams = {{ -3.f, 8.f, 5.f, -30.f, -18.f, 8.f, -50.f }};
-
-// ---- Saf DSP bloklari (cihazsiz test edilebilir) ----
-struct Biquad {
-    float b0 = 1, b1 = 0, b2 = 0, a1 = 0, a2 = 0, z1 = 0, z2 = 0;
-    void set(float nb0, float nb1, float nb2, float a0, float na1, float na2) {
-        b0 = nb0 / a0; b1 = nb1 / a0; b2 = nb2 / a0; a1 = na1 / a0; a2 = na2 / a0;
-    }
-    float process(float x) {
-        float y = b0 * x + z1;
-        z1 = b1 * x - a1 * y + z2;
-        z2 = b2 * x - a2 * y;
-        return y;
-    }
-    void highpass(float fs, float f, float q) {
-        float w = 2 * kPi * f / fs, c = std::cos(w), al = std::sin(w) / (2 * q);
-        set((1 + c) / 2, -(1 + c), (1 + c) / 2, 1 + al, -2 * c, 1 - al);
-    }
-    void lowShelf(float fs, float f, float dB) {
-        float A = std::pow(10.f, dB / 40), w = 2 * kPi * f / fs, c = std::cos(w);
-        float al = std::sin(w) / 2 * std::sqrt(2.f), t = 2 * std::sqrt(A) * al;
-        set(A * ((A + 1) - (A - 1) * c + t), 2 * A * ((A - 1) - (A + 1) * c),
-            A * ((A + 1) - (A - 1) * c - t),
-            (A + 1) + (A - 1) * c + t, -2 * ((A - 1) + (A + 1) * c), (A + 1) + (A - 1) * c - t);
-    }
-    void peaking(float fs, float f, float q, float dB) {
-        float A = std::pow(10.f, dB / 40), w = 2 * kPi * f / fs, c = std::cos(w);
-        float al = std::sin(w) / (2 * q);
-        set(1 + al * A, -2 * c, 1 - al * A, 1 + al / A, -2 * c, 1 - al / A);
-    }
-};
-
-// Ses kalinlastirma: Signalsmith Stretch (MIT) ile yuksek kaliteli perde kaydirma (~43 ms gecikme).
-class Chain {
-public:
-    Chain() {
-        hp_.highpass(kSampleRate, 90.f, 0.707f);
-        sideHp_.highpass(kSampleRate, 5500.f, 0.707f);
-        stretch_.configure(1, 2048, 512);
-    }
-
-    // Blok isler (n <= kMaxBlock).
-    void process(const float* in, float* out, int n) {
-        refresh();
-        for (int i = 0; i < n; ++i) pre_[i] = pre(std::isfinite(in[i]) ? in[i] : 0.f);
-        float* ip[1] = { pre_.data() };
-        float* op[1] = { shifted_.data() };
-        stretch_.process(ip, n, op, n);
-        for (int i = 0; i < n; ++i) out[i] = post(shifted_[i]);
-    }
-
-    static constexpr int kMaxBlock = 256;
-
-private:
-    // Perde kaymasindan once: yuksek geciren, gurultu kapisi, giris kazanci.
-    float pre(float x) {
-        x = hp_.process(x);
-        float a = std::fabs(x);
-        gateEnv_ += (a - gateEnv_) * (a > gateEnv_ ? 0.05f : 0.0005f);
-        float gTarget = (20.f * std::log10(gateEnv_ + 1e-9f)) > gateThr_ ? 1.f : 0.f;
-        gateGain_ += (gTarget - gateGain_) * (gTarget > gateGain_ ? 0.01f : 0.002f);
-        return x * gateGain_ * gain_;
-    }
-
-    // Perde kaymasindan sonra: kalinlik, netlik, de-esser, kompresor, limiter.
-    float post(float x) {
-        x = low_.process(x);
-        x = pres_.process(x);
-        float hi = sideHp_.process(x), lo = x - hi;
-        float hiLevel = 20.f * std::log10(std::fabs(hi) * 4.f + 1e-9f);
-        float target = hiLevel > deessThr_ ? std::pow(10.f, -(hiLevel - deessThr_) * 0.5f / 20.f) : 1.f;
-        deessGain_ += (target - deessGain_) * (target < deessGain_ ? 0.05f : 0.002f);
-        x = lo + hi * deessGain_;
-        float lvl = 20.f * std::log10(std::fabs(x) + 1e-9f);
-        float tg = lvl > compThr_ ? std::pow(10.f, -(lvl - compThr_) * (1.f - 1.f / 3.f) / 20.f) : 1.f;
-        compGain_ += (tg - compGain_) * (tg < compGain_ ? 0.01f : 0.0004f);
-        x *= compGain_ * kMakeup;
-        return std::tanh(x);  // yumusak limiter
-    }
-
-    void refresh() {
-        float p = gParams[kPitch], ls = gParams[kLowShelf], pr = gParams[kPresence];
-        float g = gParams[kGain];
-        gateThr_ = gParams[kGate];
-        deessThr_ = gParams[kDeessThr];
-        compThr_ = gParams[kCompThr];
-        if (p != lastPitch_) { lastPitch_ = p; stretch_.setTransposeSemitones(p); }
-        if (ls != lastLs_) { lastLs_ = ls; low_.lowShelf(kSampleRate, 200.f, ls); }
-        if (pr != lastPr_) { lastPr_ = pr; pres_.peaking(kSampleRate, 3000.f, 1.f, pr); }
-        if (g != lastGain_) { lastGain_ = g; gain_ = std::pow(10.f, g / 20.f); }
-    }
-
-    static constexpr float kMakeup = 1.5f;  // ~+3.5 dB kompresor sonrasi
-    Biquad hp_, sideHp_, low_, pres_;
-    signalsmith::stretch::SignalsmithStretch<float> stretch_;
-    std::array<float, kMaxBlock> pre_{}, shifted_{};
-    float deessGain_ = 1.f, compGain_ = 1.f, gain_ = 1.f, gateEnv_ = 0.f, gateGain_ = 0.f;
-    float gateThr_ = -50.f, deessThr_ = -30.f, compThr_ = -18.f;
-    float lastPitch_ = 1e9f, lastLs_ = 1e9f, lastPr_ = 1e9f, lastGain_ = 1e9f;
-};
+dsp::ParamSnapshot snapshot() {
+    dsp::ParamSnapshot s;
+    for (int i = 0; i < kParamCount; ++i) s[i] = gParams[i].load(std::memory_order_relaxed);
+    return s;
+}
 
 // ---- Tek uretici / tek tuketici halka tampon (giris -> cikis) ----
 class Ring {
@@ -153,14 +57,16 @@ public:
         primed_ = false;
 
         oboe::AudioStreamBuilder in;
+        // Shared: Exclusive giris baska uygulamalarin mikrofonunu kesebilir. Unprocessed: platformun
+        // AGC/gurultu bastirmasi sesi inceltip yapaylastirmasin (API 28 alti VoiceRecognition'a duser).
         in.setDirection(oboe::Direction::Input)
           ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
-          ->setSharingMode(oboe::SharingMode::Exclusive)
+          ->setSharingMode(oboe::SharingMode::Shared)
           ->setFormat(oboe::AudioFormat::Float)
           ->setChannelCount(1)
           ->setSampleRate(kSampleRate)
           ->setSampleRateConversionQuality(oboe::SampleRateConversionQuality::Medium)
-          ->setInputPreset(oboe::InputPreset::VoiceCommunication)
+          ->setInputPreset(oboe::InputPreset::Unprocessed)
           ->setDataCallback(&inCb_);
         if (in.openStream(in_) != oboe::Result::OK) return false;
 
@@ -195,16 +101,24 @@ public:
 private:
     void onInput(const float* in, int32_t frames) {
         float tmp[Chain::kMaxBlock];
+        const dsp::ParamSnapshot snap = snapshot();
         int32_t done = 0;
         while (done < frames) {
             int32_t n = std::min<int32_t>(Chain::kMaxBlock, frames - done);
-            chain_.process(in + done, tmp, n);
+            chain_.process(in + done, tmp, n, snap);
             ring_.push(tmp, static_cast<uint32_t>(n));
             done += n;
         }
     }
 
     void onOutput(float* o, int32_t frames) {
+        onOutputRaw(o, frames);
+        // Kendi sesini dinleme seviyesi (0 = sessiz). Isleme zinciri her durumda calisir.
+        float m = std::clamp(gParams[dsp::kMonitor].load(std::memory_order_relaxed) / 100.f, 0.f, 1.f);
+        if (m < 1.f) for (int32_t i = 0; i < frames; ++i) o[i] *= m;
+    }
+
+    void onOutputRaw(float* o, int32_t frames) {
         uint32_t avail = ring_.available();
         if (!primed_) {
             if (avail < prime_) { std::fill(o, o + frames, 0.f); return; }
@@ -257,6 +171,12 @@ private:
 };
 
 std::unique_ptr<Engine> gEngine;
+
+const bool kParamsInit = [] {
+    for (int i = 0; i < kParamCount; ++i) gParams[i].store(dsp::kDefaults[i]);
+    return true;
+}();
+
 
 }  // namespace
 

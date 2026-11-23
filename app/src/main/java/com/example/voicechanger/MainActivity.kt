@@ -25,7 +25,7 @@ class MainActivity : Activity() {
         toggle = Button(this).apply { setOnClickListener { onToggle() } }
         root.addView(toggle)
         root.addView(TextView(this).apply {
-            text = "Geri besleme (ıslık) olmaması için kulaklık tak."
+            text = "Kendi sesini duymamak için \"Kendi sesimi dinleme\" 0 kalsın. Dinlemek istersen kulaklık tak (hoparlörde ıslık yapar)."
             setPadding(0, pad, 0, pad)
         })
         for (d in Settings.defs) {

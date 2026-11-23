@@ -7,6 +7,7 @@
 #include <memory>
 #include <vector>
 #include <algorithm>
+#include "signalsmith-stretch.h"
 
 namespace {
 
@@ -16,7 +17,7 @@ constexpr int kSampleRate = 48000;
 enum Param { kPitch = 0, kLowShelf, kPresence, kDeessThr, kCompThr, kGain, kGate, kParamCount };
 
 // Kalibre edilmemiş başlangıç değerleri (Settings.kt ile aynı).
-std::array<std::atomic<float>, kParamCount> gParams = {{ -1.f, 6.f, 4.f, -30.f, -18.f, 8.f, -50.f }};
+std::array<std::atomic<float>, kParamCount> gParams = {{ -3.f, 8.f, 5.f, -30.f, -18.f, 8.f, -50.f }};
 
 // ---- Saf DSP bloklari (cihazsiz test edilebilir) ----
 struct Biquad {
@@ -48,63 +49,47 @@ struct Biquad {
     }
 };
 
-// Iki uclu gecikme hatti ile zaman-alani perde kaydirici (dusuk gecikme, ~30 ms pencere).
-class PitchShifter {
-public:
-    float process(float x, float ratio) {
-        buf_[w_] = x;
-        float out = 0;
-        for (int k = 0; k < 2; ++k) {
-            float p = phase_ + 0.5f * k;
-            if (p >= 1.f) p -= 1.f;
-            float delay = p * kWindow;
-            float g = 0.5f * (1.f - std::cos(2 * kPi * p));
-            out += g * read(delay);
-        }
-        phase_ += (1.f - ratio) / kWindow;
-        if (phase_ >= 1.f) phase_ -= 1.f;
-        if (phase_ < 0.f) phase_ += 1.f;
-        w_ = (w_ + 1) & kMask;
-        return out;
-    }
-private:
-    static constexpr int kSize = 4096, kMask = kSize - 1;
-    static constexpr float kWindow = 1440.f;
-    float read(float delay) const {
-        float pos = static_cast<float>(w_) - delay;
-        if (pos < 0) pos += kSize;
-        int i0 = static_cast<int>(pos), i1 = (i0 + 1) & kMask;
-        float fr = pos - i0;
-        return buf_[i0 & kMask] * (1 - fr) + buf_[i1] * fr;
-    }
-    std::array<float, kSize> buf_{};
-    int w_ = 0;
-    float phase_ = 0.f;
-};
-
+// Ses kalinlastirma: Signalsmith Stretch (MIT) ile yuksek kaliteli perde kaydirma (~43 ms gecikme).
 class Chain {
 public:
-    Chain() { hp_.highpass(kSampleRate, 80.f, 0.707f); sideHp_.highpass(kSampleRate, 5500.f, 0.707f); }
+    Chain() {
+        hp_.highpass(kSampleRate, 90.f, 0.707f);
+        sideHp_.highpass(kSampleRate, 5500.f, 0.707f);
+        stretch_.configure(1, 2048, 512);
+    }
 
-    float process(float x) {
+    // Blok isler (n <= kMaxBlock).
+    void process(const float* in, float* out, int n) {
         refresh();
+        for (int i = 0; i < n; ++i) pre_[i] = pre(std::isfinite(in[i]) ? in[i] : 0.f);
+        float* ip[1] = { pre_.data() };
+        float* op[1] = { shifted_.data() };
+        stretch_.process(ip, n, op, n);
+        for (int i = 0; i < n; ++i) out[i] = post(shifted_[i]);
+    }
+
+    static constexpr int kMaxBlock = 256;
+
+private:
+    // Perde kaymasindan once: yuksek geciren, gurultu kapisi, giris kazanci.
+    float pre(float x) {
         x = hp_.process(x);
-        // Gurultu kapisi (ham mikrofon seviyesine gore): sessizlikte hislama/geri besleme yukselmesin.
         float a = std::fabs(x);
         gateEnv_ += (a - gateEnv_) * (a > gateEnv_ ? 0.05f : 0.0005f);
         float gTarget = (20.f * std::log10(gateEnv_ + 1e-9f)) > gateThr_ ? 1.f : 0.f;
         gateGain_ += (gTarget - gateGain_) * (gTarget > gateGain_ ? 0.01f : 0.002f);
-        x *= gateGain_ * gain_;  // giris seviyesi: esikler anlamli olsun diye kompresorden once
-        x = pitch_.process(x, ratio_);
+        return x * gateGain_ * gain_;
+    }
+
+    // Perde kaymasindan sonra: kalinlik, netlik, de-esser, kompresor, limiter.
+    float post(float x) {
         x = low_.process(x);
         x = pres_.process(x);
-        // De-esser: 5.5 kHz ustu bandi esik asilinca kis.
         float hi = sideHp_.process(x), lo = x - hi;
         float hiLevel = 20.f * std::log10(std::fabs(hi) * 4.f + 1e-9f);
         float target = hiLevel > deessThr_ ? std::pow(10.f, -(hiLevel - deessThr_) * 0.5f / 20.f) : 1.f;
         deessGain_ += (target - deessGain_) * (target < deessGain_ ? 0.05f : 0.002f);
         x = lo + hi * deessGain_;
-        // Kompresor 3:1.
         float lvl = 20.f * std::log10(std::fabs(x) + 1e-9f);
         float tg = lvl > compThr_ ? std::pow(10.f, -(lvl - compThr_) * (1.f - 1.f / 3.f) / 20.f) : 1.f;
         compGain_ += (tg - compGain_) * (tg < compGain_ ? 0.01f : 0.0004f);
@@ -112,22 +97,24 @@ public:
         return std::tanh(x);  // yumusak limiter
     }
 
-private:
     void refresh() {
         float p = gParams[kPitch], ls = gParams[kLowShelf], pr = gParams[kPresence];
-        float dt = gParams[kDeessThr], ct = gParams[kCompThr], g = gParams[kGain];
+        float g = gParams[kGain];
         gateThr_ = gParams[kGate];
-        if (p != lastPitch_) { lastPitch_ = p; ratio_ = std::pow(2.f, p / 12.f); }
-        if (ls != lastLs_) { lastLs_ = ls; low_.lowShelf(kSampleRate, 220.f, ls); }
+        deessThr_ = gParams[kDeessThr];
+        compThr_ = gParams[kCompThr];
+        if (p != lastPitch_) { lastPitch_ = p; stretch_.setTransposeSemitones(p); }
+        if (ls != lastLs_) { lastLs_ = ls; low_.lowShelf(kSampleRate, 200.f, ls); }
         if (pr != lastPr_) { lastPr_ = pr; pres_.peaking(kSampleRate, 3000.f, 1.f, pr); }
         if (g != lastGain_) { lastGain_ = g; gain_ = std::pow(10.f, g / 20.f); }
-        deessThr_ = dt; compThr_ = ct;
     }
-    Biquad hp_, sideHp_, low_, pres_;
-    PitchShifter pitch_;
+
     static constexpr float kMakeup = 1.5f;  // ~+3.5 dB kompresor sonrasi
-    float ratio_ = 1.f, deessGain_ = 1.f, compGain_ = 1.f, gain_ = 1.f, gateEnv_ = 0.f, gateGain_ = 0.f, gateThr_ = -50.f;
-    float deessThr_ = -30.f, compThr_ = -18.f;
+    Biquad hp_, sideHp_, low_, pres_;
+    signalsmith::stretch::SignalsmithStretch<float> stretch_;
+    std::array<float, kMaxBlock> pre_{}, shifted_{};
+    float deessGain_ = 1.f, compGain_ = 1.f, gain_ = 1.f, gateEnv_ = 0.f, gateGain_ = 0.f;
+    float gateThr_ = -50.f, deessThr_ = -30.f, compThr_ = -18.f;
     float lastPitch_ = 1e9f, lastLs_ = 1e9f, lastPr_ = 1e9f, lastGain_ = 1e9f;
 };
 
@@ -173,7 +160,7 @@ public:
           ->setChannelCount(1)
           ->setSampleRate(kSampleRate)
           ->setSampleRateConversionQuality(oboe::SampleRateConversionQuality::Medium)
-          ->setInputPreset(oboe::InputPreset::VoicePerformance)
+          ->setInputPreset(oboe::InputPreset::VoiceCommunication)
           ->setDataCallback(&inCb_);
         if (in.openStream(in_) != oboe::Result::OK) return false;
 
@@ -207,14 +194,11 @@ public:
 
 private:
     void onInput(const float* in, int32_t frames) {
-        float tmp[256];
+        float tmp[Chain::kMaxBlock];
         int32_t done = 0;
         while (done < frames) {
-            int32_t n = std::min<int32_t>(256, frames - done);
-            for (int32_t i = 0; i < n; ++i) {
-                float s = in[done + i];
-                tmp[i] = std::isfinite(s) ? chain_.process(s) : 0.f;
-            }
+            int32_t n = std::min<int32_t>(Chain::kMaxBlock, frames - done);
+            chain_.process(in + done, tmp, n);
             ring_.push(tmp, static_cast<uint32_t>(n));
             done += n;
         }

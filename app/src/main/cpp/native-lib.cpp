@@ -13,6 +13,7 @@ namespace {
 
 using dsp::Chain;
 using dsp::kParamCount;
+using dsp::kSampleRate;
 
 std::array<std::atomic<float>, kParamCount> gParams;
 

@@ -13,10 +13,10 @@ namespace {
 constexpr float kPi = 3.14159265358979f;
 constexpr int kSampleRate = 48000;
 
-enum Param { kPitch = 0, kLowShelf, kPresence, kDeessThr, kCompThr, kGain, kParamCount };
+enum Param { kPitch = 0, kLowShelf, kPresence, kDeessThr, kCompThr, kGain, kGate, kParamCount };
 
 // Kalibre edilmemiş başlangıç değerleri (Settings.kt ile aynı).
-std::array<std::atomic<float>, kParamCount> gParams = {{ -1.f, 6.f, 4.f, -30.f, -18.f, 12.f }};
+std::array<std::atomic<float>, kParamCount> gParams = {{ -1.f, 6.f, 4.f, -30.f, -18.f, 8.f, -50.f }};
 
 // ---- Saf DSP bloklari (cihazsiz test edilebilir) ----
 struct Biquad {
@@ -88,7 +88,13 @@ public:
 
     float process(float x) {
         refresh();
-        x = hp_.process(x) * gain_;  // giris seviyesi: esikler anlamli olsun diye kompresorden once
+        x = hp_.process(x);
+        // Gurultu kapisi (ham mikrofon seviyesine gore): sessizlikte hislama/geri besleme yukselmesin.
+        float a = std::fabs(x);
+        gateEnv_ += (a - gateEnv_) * (a > gateEnv_ ? 0.05f : 0.0005f);
+        float gTarget = (20.f * std::log10(gateEnv_ + 1e-9f)) > gateThr_ ? 1.f : 0.f;
+        gateGain_ += (gTarget - gateGain_) * (gTarget > gateGain_ ? 0.01f : 0.002f);
+        x *= gateGain_ * gain_;  // giris seviyesi: esikler anlamli olsun diye kompresorden once
         x = pitch_.process(x, ratio_);
         x = low_.process(x);
         x = pres_.process(x);
@@ -110,6 +116,7 @@ private:
     void refresh() {
         float p = gParams[kPitch], ls = gParams[kLowShelf], pr = gParams[kPresence];
         float dt = gParams[kDeessThr], ct = gParams[kCompThr], g = gParams[kGain];
+        gateThr_ = gParams[kGate];
         if (p != lastPitch_) { lastPitch_ = p; ratio_ = std::pow(2.f, p / 12.f); }
         if (ls != lastLs_) { lastLs_ = ls; low_.lowShelf(kSampleRate, 220.f, ls); }
         if (pr != lastPr_) { lastPr_ = pr; pres_.peaking(kSampleRate, 3000.f, 1.f, pr); }
@@ -118,8 +125,8 @@ private:
     }
     Biquad hp_, sideHp_, low_, pres_;
     PitchShifter pitch_;
-    static constexpr float kMakeup = 2.f;  // ~+6 dB kompresor sonrasi
-    float ratio_ = 1.f, deessGain_ = 1.f, compGain_ = 1.f, gain_ = 1.f;
+    static constexpr float kMakeup = 1.5f;  // ~+3.5 dB kompresor sonrasi
+    float ratio_ = 1.f, deessGain_ = 1.f, compGain_ = 1.f, gain_ = 1.f, gateEnv_ = 0.f, gateGain_ = 0.f, gateThr_ = -50.f;
     float deessThr_ = -30.f, compThr_ = -18.f;
     float lastPitch_ = 1e9f, lastLs_ = 1e9f, lastPr_ = 1e9f, lastGain_ = 1e9f;
 };

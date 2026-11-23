@@ -9,6 +9,7 @@ object Settings {
     const val DEESS_THRESHOLD = 3
     const val COMP_THRESHOLD = 4
     const val GAIN = 5
+    const val GATE = 6
 
     // Varsayılanlar KALİBRE EDİLMEMİŞTİR: senin sesinle kulakla ayarlanacak.
     data class Def(val id: Int, val label: String, val min: Float, val max: Float, val default: Float)
@@ -19,7 +20,8 @@ object Settings {
         Def(PRESENCE, "Netlik (dB)", 0f, 10f, 4f),
         Def(DEESS_THRESHOLD, "De-esser eşiği (dB)", -40f, -10f, -30f),
         Def(COMP_THRESHOLD, "Kompresör eşiği (dB)", -30f, -6f, -18f),
-        Def(GAIN, "Ses seviyesi (dB)", 0f, 30f, 12f),
+        Def(GAIN, "Ses seviyesi (dB)", 0f, 30f, 8f),
+        Def(GATE, "Gürültü kapısı (dB)", -70f, -30f, -50f),
     )
 
     private fun prefs(c: Context) = c.getSharedPreferences("vc", Context.MODE_PRIVATE)

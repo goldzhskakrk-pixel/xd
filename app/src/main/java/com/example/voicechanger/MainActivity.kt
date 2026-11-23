@@ -14,6 +14,15 @@ import android.widget.TextView
 
 class MainActivity : Activity() {
     private lateinit var toggle: Button
+    private lateinit var meter: TextView
+    private val tick = object : Runnable {
+        override fun run() {
+            meter.text = if (VoiceService.running)
+                "Mikrofon: %.0f dB   İşlenmiş çıkış: %.0f dB".format(NativeBridge.level(0), NativeBridge.level(1))
+            else "Mikrofon: kapalı"
+            meter.postDelayed(this, 200)
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -24,6 +33,8 @@ class MainActivity : Activity() {
         }
         toggle = Button(this).apply { setOnClickListener { onToggle() } }
         root.addView(toggle)
+        meter = TextView(this)
+        root.addView(meter)
         root.addView(TextView(this).apply {
             text = "Kendi sesini duymamak için \"Kendi sesimi dinleme\" 0 kalsın. Dinlemek istersen kulaklık tak (hoparlörde ıslık yapar)."
             setPadding(0, pad, 0, pad)
@@ -50,7 +61,8 @@ class MainActivity : Activity() {
         setContentView(ScrollView(this).apply { addView(root) })
     }
 
-    override fun onResume() { super.onResume(); refresh() }
+    override fun onResume() { super.onResume(); refresh(); meter.post(tick) }
+    override fun onPause() { meter.removeCallbacks(tick); super.onPause() }
 
     private fun refresh() {
         toggle.text = if (VoiceService.running) "KAPAT" else "AÇ"

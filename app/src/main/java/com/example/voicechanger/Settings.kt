@@ -18,18 +18,18 @@ object Settings {
 
     // Sira ve varsayilanlar app/src/main/cpp/dsp.h icindeki kDefaults ile ayni olmali.
     val defs = listOf(
-        Def(PITCH, "Perde (yarım ton)", -8f, 4f, -3f),
-        Def(LOW_SHELF, "Kalınlık (dB)", 0f, 10f, 4f),
-        Def(PRESENCE, "Netlik (dB)", 0f, 8f, 2.5f),
+        Def(PITCH, "Perde (yarım ton)", -8f, 4f, -4f),
+        Def(LOW_SHELF, "Kalınlık (dB)", 0f, 10f, 6f),
+        Def(PRESENCE, "Netlik (dB)", 0f, 8f, 4f),
         Def(DEESS_THRESHOLD, "De-esser eşiği (dB)", -40f, -10f, -30f),
-        Def(COMP_THRESHOLD, "Kompresör eşiği (dB)", -30f, -6f, -20f),
+        Def(COMP_THRESHOLD, "Kompresör eşiği (dB)", -30f, -6f, -24f),
         Def(GAIN, "Çıkış seviyesi (dB)", 0f, 24f, 6f),
         Def(GATE, "Gürültü kapısı (dB)", -70f, -30f, -55f),
-        Def(FORMANT, "Ses tonu kalınlığı / formant (yarım ton)", -4f, 2f, -1f),
+        Def(FORMANT, "Ses tonu kalınlığı / formant (yarım ton)", -4f, 2f, -2f),
         Def(MONITOR, "Kendi sesimi dinleme (%)", 0f, 100f, 0f),
     )
 
-    private fun prefs(c: Context) = c.getSharedPreferences("vc", Context.MODE_PRIVATE)
+    private fun prefs(c: Context) = c.getSharedPreferences("vc2", Context.MODE_PRIVATE)
     fun get(c: Context, d: Def): Float = prefs(c).getFloat("p${d.id}", d.default)
     fun set(c: Context, d: Def, v: Float) {
         prefs(c).edit().putFloat("p${d.id}", v).apply()

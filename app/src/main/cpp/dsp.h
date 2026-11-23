@@ -17,7 +17,7 @@ enum Param {
 using ParamSnapshot = std::array<float, kParamCount>;
 
 // Settings.kt ile ayni sirada ve ayni degerlerde olmali. KALIBRE EDILMEMISTIR.
-constexpr ParamSnapshot kDefaults = {{ -3.f, 4.f, 2.5f, -30.f, -20.f, 6.f, -55.f, -1.f, 0.f }};
+constexpr ParamSnapshot kDefaults = {{ -4.f, 6.f, 4.f, -30.f, -24.f, 6.f, -55.f, -2.f, 0.f }};
 
 struct Biquad {
     float b0 = 1, b1 = 0, b2 = 0, a1 = 0, a2 = 0, z1 = 0, z2 = 0;

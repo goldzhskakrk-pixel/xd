@@ -16,6 +16,8 @@ using dsp::kParamCount;
 using dsp::kSampleRate;
 
 std::array<std::atomic<float>, kParamCount> gParams;
+std::atomic<float> gInPeak{0.f}, gOutPeak{0.f};  // son blokun tepe degeri (0..1)
+
 
 dsp::ParamSnapshot snapshot() {
     dsp::ParamSnapshot s;
@@ -103,6 +105,9 @@ private:
     void onInput(const float* in, int32_t frames) {
         float tmp[Chain::kMaxBlock];
         const dsp::ParamSnapshot snap = snapshot();
+        float pk = 0.f;
+        for (int32_t i = 0; i < frames; ++i) pk = std::max(pk, std::fabs(in[i]));
+        gInPeak.store(pk, std::memory_order_relaxed);
         int32_t done = 0;
         while (done < frames) {
             int32_t n = std::min<int32_t>(Chain::kMaxBlock, frames - done);
@@ -114,6 +119,9 @@ private:
 
     void onOutput(float* o, int32_t frames) {
         onOutputRaw(o, frames);
+        float pk = 0.f;
+        for (int32_t i = 0; i < frames; ++i) pk = std::max(pk, std::fabs(o[i]));
+        gOutPeak.store(pk, std::memory_order_relaxed);
         // Kendi sesini dinleme seviyesi (0 = sessiz). Isleme zinciri her durumda calisir.
         float m = std::clamp(gParams[dsp::kMonitor].load(std::memory_order_relaxed) / 100.f, 0.f, 1.f);
         if (m < 1.f) for (int32_t i = 0; i < frames; ++i) o[i] *= m;
@@ -189,6 +197,10 @@ JNIEXPORT jboolean JNICALL Java_com_example_voicechanger_NativeBridge_start(JNIE
 }
 JNIEXPORT void JNICALL Java_com_example_voicechanger_NativeBridge_stop(JNIEnv*, jobject) {
     if (gEngine) { gEngine->stop(); gEngine.reset(); }
+}
+JNIEXPORT jfloat JNICALL Java_com_example_voicechanger_NativeBridge_level(JNIEnv*, jobject, jint which) {
+    float v = (which == 0 ? gInPeak : gOutPeak).load(std::memory_order_relaxed);
+    return dsp::toDb(v);
 }
 JNIEXPORT void JNICALL Java_com_example_voicechanger_NativeBridge_setParam(JNIEnv*, jobject, jint id, jfloat v) {
     if (id >= 0 && id < kParamCount && std::isfinite(v)) gParams[id].store(v);
